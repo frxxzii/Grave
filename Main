@@ -299,4 +299,185 @@ else
     if Flags["Aim/AttractionStrength"] > 1000 then Flags["Aim/AttractionStrength"] = 1000 end
 end
 
--- End appended block
+-- === APPENDED HIGHLIGHT & TOOL MONITORING (performance-optimized) ===
+-- Improves highlight system by reusing one Highlight per player and throttling checks.
+
+local PlayerStates = {}
+
+local function safeCreateHighlight()
+    local ok, inst = pcall(function() return Instance.new("Highlight") end)
+    if ok and inst then
+        inst.Name = "Grave_Highlight"
+        inst.Enabled = false
+        -- Conservative defaults; user can override via flags/UI later
+        inst.OutlineTransparency = 0.6
+        inst.FillTransparency = 0.85
+        inst.Parent = workspace
+        return inst
+    end
+    return nil
+end
+
+local function createBillboardForCharacter(char, player)
+    if not char then return nil end
+    local head = char:FindFirstChild("Head") or char:FindFirstChild("UpperTorso") or char:FindFirstChild("HumanoidRootPart")
+    if not head then return nil end
+    local bg = Instance.new("BillboardGui")
+    bg.Name = "Grave_Billboard"
+    bg.Adornee = head
+    bg.Size = UDim2.new(0, 200, 0, 50)
+    bg.StudsOffsetWorldSpace = Vector3.new(0, 2.5, 0)
+    bg.AlwaysOnTop = true
+    -- Text label
+    local lbl = Instance.new("TextLabel")
+    lbl.Name = "Grave_Label"
+    lbl.Size = UDim2.new(1, 0, 1, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.TextScaled = true
+    lbl.Font = Enum.Font.SourceSansSemibold
+    lbl.TextColor3 = UI_THEME.Text
+    lbl.TextStrokeTransparency = 0.6
+    lbl.Parent = bg
+    -- Attach to head
+    bg.Parent = head
+    return bg
+end
+
+local function setupPlayerMonitoring(player)
+    if PlayerStates[player] then return end
+    local state = { highlight = safeCreateHighlight(), billboard = nil, hasTool = false }
+    PlayerStates[player] = state
+
+    local function clearDisplay()
+        if state.highlight then
+            state.highlight.Enabled = false
+            state.highlight.Adornee = nil
+        end
+        if state.billboard and state.billboard.Parent then
+            state.billboard:Destroy()
+            state.billboard = nil
+        end
+        state.hasTool = false
+    end
+
+    local function onCharacter(char)
+        -- When character spawns, ensure highlight adornee if currently has tool
+        task.wait(0.1)
+        -- Do an immediate check and set billboard if needed
+        local has = false
+        for _, c in ipairs(char:GetChildren()) do
+            if c:IsA("Tool") then has = true break end
+        end
+        if has then
+            if state.highlight then state.highlight.Adornee = char end
+            if state.highlight then state.highlight.Enabled = true end
+            if not state.billboard then
+                state.billboard = createBillboardForCharacter(char, player)
+            end
+            state.hasTool = true
+        else
+            clearDisplay()
+        end
+    end
+
+    -- Connect character events
+    if player.Character then onCharacter(player.Character) end
+    player.CharacterAdded:Connect(onCharacter)
+    player.CharacterRemoving:Connect(function()
+        clearDisplay()
+    end)
+
+    -- Cleanup on leaving
+    player.AncestryChanged:Connect(function(_, parent)
+        if not parent then
+            if PlayerStates[player] then
+                if PlayerStates[player].highlight then
+                    PlayerStates[player].highlight:Destroy()
+                end
+                PlayerStates[player] = nil
+            end
+        end
+    end)
+end
+
+-- Initialize existing players
+for _, p in ipairs(Players:GetPlayers()) do
+    setupPlayerMonitoring(p)
+end
+Players.PlayerAdded:Connect(setupPlayerMonitoring)
+Players.PlayerRemoving:Connect(function(p)
+    if PlayerStates[p] then
+        if PlayerStates[p].highlight then PlayerStates[p].highlight:Destroy() end
+        if PlayerStates[p].billboard and PlayerStates[p].billboard.Parent then PlayerStates[p].billboard:Destroy() end
+        PlayerStates[p] = nil
+    end
+end)
+
+local function playerHasToolInCharacter(char)
+    if not char then return false end
+    for _, c in ipairs(char:GetChildren()) do
+        if c:IsA("Tool") then return true end
+    end
+    return false
+end
+
+local function updateAllPlayersOnce()
+    local myChar = LocalPlayer.Character
+    local myRoot = myChar and (myChar.PrimaryPart or myChar:FindFirstChild("HumanoidRootPart"))
+    for player, state in pairs(PlayerStates) do
+        local ok, err = pcall(function()
+            local char = player.Character
+            if not char then
+                -- ensure disabled
+                if state.highlight then state.highlight.Enabled = false state.highlight.Adornee = nil end
+                if state.billboard and state.billboard.Parent then state.billboard:Destroy() state.billboard = nil end
+                state.hasTool = false
+                return
+            end
+            local hasTool = playerHasToolInCharacter(char)
+            if hasTool then
+                if state.highlight then state.highlight.Adornee = char end
+                if state.highlight then state.highlight.Enabled = true end
+                if not state.billboard then state.billboard = createBillboardForCharacter(char, player) end
+                -- update text with name and distance
+                if state.billboard then
+                    local lbl = state.billboard:FindFirstChild("Grave_Label")
+                    if lbl then
+                        local textParts = {}
+                        if Flags["LocalUI/ClosestPlayer/ShowDisplayName"] then table.insert(textParts, player.DisplayName) end
+                        if Flags["LocalUI/ClosestPlayer/ShowUsername"] then table.insert(textParts, "("..player.Name..")") end
+                        if myRoot and (char.PrimaryPart or char:FindFirstChild("HumanoidRootPart")) then
+                            local otherRoot = char.PrimaryPart or char:FindFirstChild("HumanoidRootPart")
+                            if otherRoot then
+                                local dist = (myRoot.Position - otherRoot.Position).Magnitude
+                                if Flags["LocalUI/ClosestPlayer/ShowDistance"] then table.insert(textParts, string.format("%.1f stud", dist)) end
+                            end
+                        end
+                        lbl.Text = table.concat(textParts, " ")
+                    end
+                end
+                state.hasTool = true
+            else
+                if state.highlight then state.highlight.Enabled = false state.highlight.Adornee = nil end
+                if state.billboard and state.billboard.Parent then state.billboard:Destroy() state.billboard = nil end
+                state.hasTool = false
+            end
+        end)
+        if not ok then
+            -- ignore per-player errors
+        end
+    end
+end
+
+-- Throttled updater driven by Settings/Tracking/SamplingRate (clamped)
+task.spawn(function()
+    while true do
+        local rate = tonumber(Flags["Settings/Tracking/SamplingRate"]) or 60
+        rate = math.clamp(rate, 1, 200) -- keep a reasonable upper bound for client-side updates
+        local waitTime = 1 / rate
+        task.wait(math.max(waitTime, 0.03))
+        pcall(updateAllPlayersOnce)
+    end
+end)
+
+-- End appended highlight code
